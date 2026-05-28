@@ -194,6 +194,70 @@ class _ID3D11DeviceContext(_ID3D11DeviceChild):
              ctypes.POINTER(D3D11_BOX)]),
         comtypes.STDMETHOD(None, "CopyResource",
             [ctypes.c_void_p, ctypes.c_void_p]),
+        comtypes.STDMETHOD(None, "UpdateSubresource"),
+        comtypes.STDMETHOD(None, "CopyStructureCount"),
+        comtypes.STDMETHOD(None, "ClearRenderTargetView"),
+        comtypes.STDMETHOD(None, "ClearUnorderedAccessViewUint"),
+        comtypes.STDMETHOD(None, "ClearUnorderedAccessViewFloat"),
+        comtypes.STDMETHOD(None, "ClearDepthStencilView"),
+        comtypes.STDMETHOD(None, "GenerateMips"),
+        comtypes.STDMETHOD(None, "SetResourceMinLOD"),
+        comtypes.STDMETHOD(None, "GetResourceMinLOD"),
+        comtypes.STDMETHOD(None, "ResolveSubresource"),
+        comtypes.STDMETHOD(None, "ExecuteCommandList"),
+        comtypes.STDMETHOD(None, "HSSetShaderResources"),
+        comtypes.STDMETHOD(None, "HSSetShader"),
+        comtypes.STDMETHOD(None, "HSSetSamplers"),
+        comtypes.STDMETHOD(None, "HSSetConstantBuffers"),
+        comtypes.STDMETHOD(None, "DSSetShaderResources"),
+        comtypes.STDMETHOD(None, "DSSetShader"),
+        comtypes.STDMETHOD(None, "DSSetSamplers"),
+        comtypes.STDMETHOD(None, "DSSetConstantBuffers"),
+        comtypes.STDMETHOD(None, "CSSetShaderResources"),
+        comtypes.STDMETHOD(None, "CSSetUnorderedAccessViews"),
+        comtypes.STDMETHOD(None, "CSSetShader"),
+        comtypes.STDMETHOD(None, "CSSetSamplers"),
+        comtypes.STDMETHOD(None, "CSSetConstantBuffers"),
+        comtypes.STDMETHOD(None, "VSGetConstantBuffers"),
+        comtypes.STDMETHOD(None, "PSGetShaderResources"),
+        comtypes.STDMETHOD(None, "PSGetShader"),
+        comtypes.STDMETHOD(None, "PSGetSamplers"),
+        comtypes.STDMETHOD(None, "VSGetShader"),
+        comtypes.STDMETHOD(None, "PSGetConstantBuffers"),
+        comtypes.STDMETHOD(None, "IAGetInputLayout"),
+        comtypes.STDMETHOD(None, "IAGetVertexBuffers"),
+        comtypes.STDMETHOD(None, "IAGetIndexBuffer"),
+        comtypes.STDMETHOD(None, "GSGetConstantBuffers"),
+        comtypes.STDMETHOD(None, "GSGetShader"),
+        comtypes.STDMETHOD(None, "IAGetPrimitiveTopology"),
+        comtypes.STDMETHOD(None, "VSGetShaderResources"),
+        comtypes.STDMETHOD(None, "VSGetSamplers"),
+        comtypes.STDMETHOD(None, "GetPredication"),
+        comtypes.STDMETHOD(None, "GSGetShaderResources"),
+        comtypes.STDMETHOD(None, "GSGetSamplers"),
+        comtypes.STDMETHOD(None, "OMGetRenderTargets"),
+        comtypes.STDMETHOD(None, "OMGetRenderTargetsAndUnorderedAccessViews"),
+        comtypes.STDMETHOD(None, "OMGetBlendState"),
+        comtypes.STDMETHOD(None, "OMGetDepthStencilState"),
+        comtypes.STDMETHOD(None, "SOGetTargets"),
+        comtypes.STDMETHOD(None, "RSGetState"),
+        comtypes.STDMETHOD(None, "RSGetViewports"),
+        comtypes.STDMETHOD(None, "RSGetScissorRects"),
+        comtypes.STDMETHOD(None, "HSGetShaderResources"),
+        comtypes.STDMETHOD(None, "HSGetShader"),
+        comtypes.STDMETHOD(None, "HSGetSamplers"),
+        comtypes.STDMETHOD(None, "HSGetConstantBuffers"),
+        comtypes.STDMETHOD(None, "DSGetShaderResources"),
+        comtypes.STDMETHOD(None, "DSGetShader"),
+        comtypes.STDMETHOD(None, "DSGetSamplers"),
+        comtypes.STDMETHOD(None, "DSGetConstantBuffers"),
+        comtypes.STDMETHOD(None, "CSGetShaderResources"),
+        comtypes.STDMETHOD(None, "CSGetUnorderedAccessViews"),
+        comtypes.STDMETHOD(None, "CSGetShader"),
+        comtypes.STDMETHOD(None, "CSGetSamplers"),
+        comtypes.STDMETHOD(None, "CSGetConstantBuffers"),
+        comtypes.STDMETHOD(None, "ClearState"),
+        comtypes.STDMETHOD(None, "Flush"),
     ]
 
 class _ID3D11Device(comtypes.IUnknown):
@@ -267,30 +331,118 @@ def _com_release(obj):
             pass
 
 
-def _open_shared_resource(device, handle: int):
-    """ID3D11Device::OpenSharedResource → _ID3D11Resource comtypes オブジェクト"""
-    out = ctypes.c_void_p(0)
-    iid = _IID_ID3D11Resource
-    # handle は uint32 → HANDLE (void*) にキャスト
-    h_handle = ctypes.c_void_p(handle & 0xFFFFFFFF)
-    hr = device.OpenSharedResource(
-        h_handle,
-        ctypes.byref(iid),
-        ctypes.byref(out),
-    )
-    if hr != S_OK:
-        raise RuntimeError(f"OpenSharedResource failed: hr=0x{hr & 0xFFFFFFFF:08X}")
-    return ctypes.cast(out, ctypes.POINTER(_ID3D11Resource))
+def _open_shared_resource(device, handle: int, src_pid: int = 0):
+    """ID3D11Device::OpenSharedResource / OpenSharedResource1 で共有テクスチャを開く。
+
+    OBS game-capture の tex_handle はグローバル共有ハンドルなので
+    DuplicateHandle 不要でそのまま渡せる。
+    上位ビットが立っている場合は DXGI NT ハンドル → OpenSharedResource1 を使う。
+    """
+    is_nt_handle = bool(handle & 0x80000000)
+    raw_handle   = ctypes.c_void_p(handle & 0xFFFFFFFF)
+
+    if is_nt_handle:
+        print(f"[obscam] NT共有ハンドル (0x{handle:08X}) → OpenSharedResource1")
+
+        # ID3D11Device1 を IUnknown から直接定義
+        # vtable: QI/AddRef/Release + ID3D11Device(23) + GetImmCtx1/CreateDeferred1/OpenSharedResource1/OpenSharedResourceByName
+        class _ID3D11Device1(comtypes.IUnknown):
+            _iid_ = comtypes.GUID("{a04bfb29-08ef-43d6-a49c-a9bdbdcbe686}")
+            _methods_ = (
+                # --- ID3D11Device (23 methods) ---
+                comtypes.STDMETHOD(comtypes.HRESULT, "CreateBuffer"),
+                comtypes.STDMETHOD(comtypes.HRESULT, "CreateTexture1D"),
+                comtypes.STDMETHOD(comtypes.HRESULT, "CreateTexture2D"),
+                comtypes.STDMETHOD(comtypes.HRESULT, "CreateTexture3D"),
+                comtypes.STDMETHOD(comtypes.HRESULT, "CreateShaderResourceView"),
+                comtypes.STDMETHOD(comtypes.HRESULT, "CreateUnorderedAccessView"),
+                comtypes.STDMETHOD(comtypes.HRESULT, "CreateRenderTargetView"),
+                comtypes.STDMETHOD(comtypes.HRESULT, "CreateDepthStencilView"),
+                comtypes.STDMETHOD(comtypes.HRESULT, "CreateInputLayout"),
+                comtypes.STDMETHOD(comtypes.HRESULT, "CreateVertexShader"),
+                comtypes.STDMETHOD(comtypes.HRESULT, "CreateGeometryShader"),
+                comtypes.STDMETHOD(comtypes.HRESULT, "CreateGeometryShaderWithStreamOutput"),
+                comtypes.STDMETHOD(comtypes.HRESULT, "CreatePixelShader"),
+                comtypes.STDMETHOD(comtypes.HRESULT, "CreateHullShader"),
+                comtypes.STDMETHOD(comtypes.HRESULT, "CreateDomainShader"),
+                comtypes.STDMETHOD(comtypes.HRESULT, "CreateComputeShader"),
+                comtypes.STDMETHOD(comtypes.HRESULT, "CreateClassLinkage"),
+                comtypes.STDMETHOD(comtypes.HRESULT, "CreateBlendState"),
+                comtypes.STDMETHOD(comtypes.HRESULT, "CreateDepthStencilState"),
+                comtypes.STDMETHOD(comtypes.HRESULT, "CreateRasterizerState"),
+                comtypes.STDMETHOD(comtypes.HRESULT, "CreateSamplerState"),
+                comtypes.STDMETHOD(comtypes.HRESULT, "CreateQuery"),
+                comtypes.STDMETHOD(comtypes.HRESULT, "CreatePredicate"),
+                comtypes.STDMETHOD(comtypes.HRESULT, "CreateCounter"),
+                comtypes.STDMETHOD(comtypes.HRESULT, "CreateDeferredContext"),
+                comtypes.STDMETHOD(comtypes.HRESULT, "OpenSharedResource"),
+                comtypes.STDMETHOD(comtypes.HRESULT, "CheckFormatSupport"),
+                comtypes.STDMETHOD(comtypes.HRESULT, "CheckMultisampleQualityLevels"),
+                comtypes.STDMETHOD(None,              "CheckCounterInfo"),
+                comtypes.STDMETHOD(comtypes.HRESULT, "CheckCounter"),
+                comtypes.STDMETHOD(comtypes.HRESULT, "CheckFeatureSupport"),
+                comtypes.STDMETHOD(comtypes.HRESULT, "GetPrivateData"),
+                comtypes.STDMETHOD(comtypes.HRESULT, "SetPrivateData"),
+                comtypes.STDMETHOD(comtypes.HRESULT, "SetPrivateDataInterface"),
+                comtypes.STDMETHOD(None,              "GetFeatureLevel"),
+                comtypes.STDMETHOD(None,              "GetCreationFlags"),
+                comtypes.STDMETHOD(comtypes.HRESULT, "GetDeviceRemovedReason"),
+                comtypes.STDMETHOD(None,              "GetImmediateContext"),
+                comtypes.STDMETHOD(comtypes.HRESULT, "SetExceptionMode"),
+                comtypes.STDMETHOD(None,              "GetExceptionMode"),
+                # --- ID3D11Device1 追加分 ---
+                comtypes.STDMETHOD(None,              "GetImmediateContext1"),
+                comtypes.STDMETHOD(comtypes.HRESULT,  "CreateDeferredContext1"),
+                comtypes.STDMETHOD(comtypes.HRESULT,  "OpenSharedResource1",
+                    [ctypes.c_void_p,
+                     ctypes.POINTER(comtypes.GUID),
+                     ctypes.POINTER(ctypes.c_void_p)]),
+                comtypes.STDMETHOD(comtypes.HRESULT,  "OpenSharedResourceByName"),
+            )
+
+        try:
+            dev1 = device.QueryInterface(_ID3D11Device1)
+        except Exception as e:
+            raise RuntimeError(f"QI ID3D11Device1 失敗: {e}")
+
+        out = ctypes.c_void_p(0)
+        iid = _IID_ID3D11Resource
+        try:
+            hr = dev1.OpenSharedResource1(
+                raw_handle,
+                ctypes.byref(iid),
+                ctypes.byref(out),
+            )
+        except Exception as e:
+            raise RuntimeError(f"OpenSharedResource1 呼び出し例外: {e}")
+        if hr != S_OK:
+            raise RuntimeError(f"OpenSharedResource1 失敗: hr=0x{hr & 0xFFFFFFFF:08X}")
+        print(f"[obscam] OpenSharedResource1 成功")
+        return ctypes.cast(out, ctypes.POINTER(_ID3D11Resource))
+
+    else:
+        print(f"[obscam] 通常共有ハンドル (0x{handle:08X}) → OpenSharedResource")
+        out = ctypes.c_void_p(0)
+        iid = _IID_ID3D11Resource
+        hr  = device.OpenSharedResource(
+            raw_handle,
+            ctypes.byref(iid),
+            ctypes.byref(out),
+        )
+        if hr != S_OK:
+            raise RuntimeError(f"OpenSharedResource 失敗: hr=0x{hr & 0xFFFFFFFF:08X}")
+        print(f"[obscam] OpenSharedResource 成功")
+        return ctypes.cast(out, ctypes.POINTER(_ID3D11Resource))
 
 
-def _create_staging_texture(device, width: int, height: int):
+def _create_staging_texture(device, width: int, height: int, fmt: int = DXGI_FORMAT_B8G8R8A8_UNORM):
     """CPU読み取り用 Staging テクスチャを作成"""
     desc = D3D11_TEXTURE2D_DESC()
     desc.Width          = width
     desc.Height         = height
     desc.MipLevels      = 1
     desc.ArraySize      = 1
-    desc.Format         = DXGI_FORMAT_B8G8R8A8_UNORM
+    desc.Format         = fmt
     desc.SampleDesc     = DXGI_SAMPLE_DESC(1, 0)
     desc.Usage          = D3D11_USAGE_STAGING
     desc.CPUAccessFlags = D3D11_CPU_ACCESS_READ
@@ -474,8 +626,18 @@ class ObsCam:
         already_hooked = bool(self._hook_restart)
 
         if already_hooked:
-            print("[obscam] フック検出（OBS等が既に注入済み）→ そのまま使用")
-            # Restart は送らずそのまま続行
+            print("[obscam] フック検出（OBS等が既に注入済み）→ Restart を送って再初期化")
+            # Stop を送って既存キャプチャを停止させてから Restart
+            _hook_stop_tmp = open_event(
+                EVENT_MODIFY_STATE | SYNCHRONIZE, False,
+                _map_name("CaptureHook_Stop", self._pid),
+            )
+            if _hook_stop_tmp:
+                set_event(_hook_stop_tmp)
+                close_handle(_hook_stop_tmp)
+                time.sleep(0.3)
+            set_event(self._hook_restart)
+            time.sleep(0.5)   # フックが再起動するのを少し待つ
         else:
             print("[obscam] フックなし → DLL 注入開始")
             self._inject()
@@ -528,11 +690,17 @@ class ObsCam:
         wait_for_single_object(self._hook_ready, 5000)   # 5秒タイムアウト
         print("[obscam] hook_ready 受信")
 
-        # 10. テクスチャミューテックス
+        # 10. テクスチャミューテックス（ReleaseMutexできるようMUTEX_ALL_ACCESSで開く）
+        MUTEX_ALL_ACCESS = 0x1F0001
         for i, mname in enumerate(["CaptureHook_TextureMutex1", "CaptureHook_TextureMutex2"]):
-            self._tex_mutex[i] = open_mutex(SYNCHRONIZE, False, _map_name(mname, self._pid))
-            if not self._tex_mutex[i]:
+            full_name = _map_name(mname, self._pid)
+            h = open_mutex(MUTEX_ALL_ACCESS, False, full_name)
+            if not h:
+                # fallback: SYNCHRONIZE のみ
+                h = open_mutex(SYNCHRONIZE, False, full_name)
+            if not h:
                 raise RuntimeError(f"OpenMutexPlusId failed: {mname}")
+            self._tex_mutex[i] = h
 
         # 11. HookInfo を再度開く（フック後に更新される）
         self._open_hook_info_map()
@@ -543,9 +711,20 @@ class ObsCam:
         # 13. D3D11 デバイス作成 & 共有リソースを開く（リトライあり）
         self._open_d3d11_resources()
 
-        # 14. Staging テクスチャ作成 & ROI ボックス設定
+        # 14. 共有テクスチャのフォーマットを取得してStagingテクスチャを作成
+        try:
+            tex2d = self._shared_res.QueryInterface(_ID3D11Texture2D)
+            desc  = D3D11_TEXTURE2D_DESC()
+            tex2d.GetDesc(ctypes.byref(desc))
+            shared_fmt = desc.Format
+            print(f"[obscam] 共有テクスチャ fmt={shared_fmt} ({desc.Width}x{desc.Height})")
+        except Exception as e:
+            print(f"[obscam] 共有テクスチャ desc 取得失敗 → BGRA fallback: {e}")
+            shared_fmt = DXGI_FORMAT_B8G8R8A8_UNORM
+
+        self._shared_fmt = shared_fmt
         self._staging_tex = _create_staging_texture(
-            self._device, self._roi_w, self._roi_h
+            self._device, self._roi_w, self._roi_h, fmt=shared_fmt
         )
         self._roi_box = self._calc_roi_box()
 
@@ -637,6 +816,10 @@ class ObsCam:
             name = _data_map_name(
                 self._hook_info.window, self._hook_info.map_id
             )
+            print(f"[obscam] shtex map_name={name}  "
+                  f"cx={self._hook_info.cx}  cy={self._hook_info.cy}  "
+                  f"map_size={self._hook_info.map_size}  "
+                  f"type={self._hook_info.type}")
             self._data_map = open_file_mapping(FILE_MAP_ALL_ACCESS, False, name)
             if self._data_map:
                 ptr = map_view_of_file(
@@ -646,6 +829,7 @@ class ObsCam:
                 if ptr:
                     self._shtex_ptr = ptr
                     self._shtex     = ShtexData.from_address(ptr)
+                    print(f"[obscam] tex_handle=0x{self._shtex.tex_handle:08X}")
                     return
             time.sleep(1.0)
 
@@ -658,7 +842,7 @@ class ObsCam:
 
             handle = int(self._shtex.tex_handle)
             try:
-                self._shared_res = _open_shared_resource(self._device, handle)
+                self._shared_res = _open_shared_resource(self._device, handle, src_pid=self._pid)
                 return
             except RuntimeError as e:
                 print(f"[obscam] OpenSharedResource 失敗 (attempt {attempt+1}): {e}")
@@ -727,16 +911,50 @@ class ObsCam:
 
     def _grab(self) -> Optional[torch.Tensor]:
         # GPU 上で ROI をコピー（共有リソース → ステージング or interop テクスチャ）
-        dst = (self._staging_tex if not self._interop
-               else self._staging_tex)  # interop 時も staging に書いてから CUDA へ
+        dst = self._staging_tex
+
+        # デバッグ: shared_res の desc を確認（初回のみ）
+        if not getattr(self, '_dbg_desc_printed', False):
+            try:
+                tex2d = self._shared_res.QueryInterface(_ID3D11Texture2D)
+                desc  = D3D11_TEXTURE2D_DESC()
+                tex2d.GetDesc(ctypes.byref(desc))
+                print(f"[obscam][DBG] shared_res desc: "
+                      f"{desc.Width}x{desc.Height} fmt={desc.Format} "
+                      f"usage={desc.Usage} misc={desc.MiscFlags:#010x}")
+                self._tex2d_shared = tex2d
+            except Exception as e:
+                print(f"[obscam][DBG] shared_res QI Texture2D 失敗: {e}")
+            self._dbg_desc_printed = True
+
+        # texture_mutex でロックしてからコピー（OBS と同じプロトコル）
+        # tex_mutex[0] or [1] を取得できた方でコピーする
+        locked_idx = -1
+        for i, mx in enumerate(self._tex_mutex):
+            if not mx:
+                continue
+            ret = wait_for_single_object(mx, 0)   # ノンブロッキング
+            if ret == WAIT_OBJECT_0 or ret == 0x00000080:  # WAIT_ABANDONED も取得扱い
+                locked_idx = i
+                break
+
+        if locked_idx == -1:
+            # どちらのミューテックスも取れない場合はスキップ（次フレームで再試行）
+            return None
 
         try:
             _copy_subresource_region(
                 self._ctx, dst, self._shared_res, self._roi_box
             )
+            self._ctx.Flush()
         except Exception as e:
             print(f"[obscam] CopySubresourceRegion 失敗: {e}")
             return None
+        finally:
+            # ミューテックスを解放
+            ctypes.windll.kernel32.ReleaseMutex(
+                ctypes.c_void_p(self._tex_mutex[locked_idx])
+            )
 
         if self._interop and self._cuda_res is not None:
             return self._to_tensor_cuda()
@@ -801,7 +1019,6 @@ class ObsCam:
             return None
 
         try:
-            row_bytes = self._roi_w * 4
             buf = (ctypes.c_uint8 * (mapped.RowPitch * self._roi_h)).from_address(
                 mapped.pData
             )
@@ -810,7 +1027,21 @@ class ObsCam:
             )
             if mapped.RowPitch // 4 != self._roi_w:
                 t = t[:, :self._roi_w, :]
-            t = t[..., :3].clone()  # BGRA → BGR, CPU テンソルにコピー
+
+            # fmt=27 (RGBA) → BGR,  fmt=87 (BGRA) → BGR
+            DXGI_FORMAT_R8G8B8A8_UNORM = 28
+            if getattr(self, '_shared_fmt', DXGI_FORMAT_B8G8R8A8_UNORM) in (27, 28):
+                # RGBA → BGR: チャンネル順を R,G,B → B,G,R に入れ替え
+                t = t[..., [2, 1, 0]].clone()
+            else:
+                # BGRA → BGR
+                t = t[..., :3].clone()
+
+            # デバッグ: 最初のフレームのみ
+            if not getattr(self, '_dbg_printed', False):
+                print(f"[obscam][DBG] frame max={t.max().item()}  mean={t.float().mean().item():.1f}  "
+                      f"RowPitch={mapped.RowPitch}  fmt={getattr(self,'_shared_fmt','?')}")
+                self._dbg_printed = True
         finally:
             _unmap_texture(self._ctx, self._staging_tex)
 
