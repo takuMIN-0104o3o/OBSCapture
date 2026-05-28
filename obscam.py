@@ -12,6 +12,12 @@ C++ の GameCapture クラスを Python + ctypes で完全再実装。
     5. GPU 上でROI をコピーして torch.Tensor(CUDA, uint8, BGR) を返す
 
 返り値: torch.Tensor(CUDA, uint8, [H, W, 3], BGR)  ← YOLO 直投入可
+
+修正点 (2025-06):
+    - _ID3D11Device1 をモジュールレベルに移動（関数内再定義による comtypes 型破壊を修正）
+    - NT ハンドル (bit31=1) は DuplicateHandle でカレントプロセスへ複製してから使用
+      （ゲームプロセスのハンドルを直接 OpenSharedResource1 に渡すとアクセス違反）
+    - D3D11CreateDevice の restype を明示設定
 """
 from __future__ import annotations
 
@@ -113,6 +119,9 @@ import comtypes
 import comtypes.client
 
 _d3d11 = ctypes.windll.d3d11
+
+# [修正③] D3D11CreateDevice の restype を明示設定（未設定だと再試行時にクラッシュすることがある）
+_d3d11.D3D11CreateDevice.restype = ctypes.c_long
 
 # IID
 _IID_ID3D11Resource  = comtypes.GUID("{dc8e63f3-d12b-4952-b47b-5e45026a862d}")
@@ -298,6 +307,65 @@ class _ID3D11Device(comtypes.IUnknown):
     ]
 
 
+# [修正①] _ID3D11Device1 をモジュールレベルに移動
+# 元のコードは _open_shared_resource 関数の内部で毎回クラスを再定義していた。
+# comtypes は IID をキーにインターフェースをキャッシュするため、
+# 同一 IID のクラスを再定義するとキャッシュ衝突が起き vtable が壊れる。
+class _ID3D11Device1(comtypes.IUnknown):
+    _iid_ = comtypes.GUID("{a04bfb29-08ef-43d6-a49c-a9bdbdcbe686}")
+    _methods_ = [
+        # --- ID3D11Device の 40 メソッドをすべて列挙（vtable 順に合わせること）---
+        comtypes.STDMETHOD(comtypes.HRESULT, "CreateBuffer"),
+        comtypes.STDMETHOD(comtypes.HRESULT, "CreateTexture1D"),
+        comtypes.STDMETHOD(comtypes.HRESULT, "CreateTexture2D"),
+        comtypes.STDMETHOD(comtypes.HRESULT, "CreateTexture3D"),
+        comtypes.STDMETHOD(comtypes.HRESULT, "CreateShaderResourceView"),
+        comtypes.STDMETHOD(comtypes.HRESULT, "CreateUnorderedAccessView"),
+        comtypes.STDMETHOD(comtypes.HRESULT, "CreateRenderTargetView"),
+        comtypes.STDMETHOD(comtypes.HRESULT, "CreateDepthStencilView"),
+        comtypes.STDMETHOD(comtypes.HRESULT, "CreateInputLayout"),
+        comtypes.STDMETHOD(comtypes.HRESULT, "CreateVertexShader"),
+        comtypes.STDMETHOD(comtypes.HRESULT, "CreateGeometryShader"),
+        comtypes.STDMETHOD(comtypes.HRESULT, "CreateGeometryShaderWithStreamOutput"),
+        comtypes.STDMETHOD(comtypes.HRESULT, "CreatePixelShader"),
+        comtypes.STDMETHOD(comtypes.HRESULT, "CreateHullShader"),
+        comtypes.STDMETHOD(comtypes.HRESULT, "CreateDomainShader"),
+        comtypes.STDMETHOD(comtypes.HRESULT, "CreateComputeShader"),
+        comtypes.STDMETHOD(comtypes.HRESULT, "CreateClassLinkage"),
+        comtypes.STDMETHOD(comtypes.HRESULT, "CreateBlendState"),
+        comtypes.STDMETHOD(comtypes.HRESULT, "CreateDepthStencilState"),
+        comtypes.STDMETHOD(comtypes.HRESULT, "CreateRasterizerState"),
+        comtypes.STDMETHOD(comtypes.HRESULT, "CreateSamplerState"),
+        comtypes.STDMETHOD(comtypes.HRESULT, "CreateQuery"),
+        comtypes.STDMETHOD(comtypes.HRESULT, "CreatePredicate"),
+        comtypes.STDMETHOD(comtypes.HRESULT, "CreateCounter"),
+        comtypes.STDMETHOD(comtypes.HRESULT, "CreateDeferredContext"),
+        comtypes.STDMETHOD(comtypes.HRESULT, "OpenSharedResource"),
+        comtypes.STDMETHOD(comtypes.HRESULT, "CheckFormatSupport"),
+        comtypes.STDMETHOD(comtypes.HRESULT, "CheckMultisampleQualityLevels"),
+        comtypes.STDMETHOD(None,              "CheckCounterInfo"),
+        comtypes.STDMETHOD(comtypes.HRESULT,  "CheckCounter"),
+        comtypes.STDMETHOD(comtypes.HRESULT,  "CheckFeatureSupport"),
+        comtypes.STDMETHOD(comtypes.HRESULT,  "GetPrivateData"),
+        comtypes.STDMETHOD(comtypes.HRESULT,  "SetPrivateData"),
+        comtypes.STDMETHOD(comtypes.HRESULT,  "SetPrivateDataInterface"),
+        comtypes.STDMETHOD(None,              "GetFeatureLevel"),
+        comtypes.STDMETHOD(None,              "GetCreationFlags"),
+        comtypes.STDMETHOD(comtypes.HRESULT,  "GetDeviceRemovedReason"),
+        comtypes.STDMETHOD(None,              "GetImmediateContext"),
+        comtypes.STDMETHOD(comtypes.HRESULT,  "SetExceptionMode"),
+        comtypes.STDMETHOD(None,              "GetExceptionMode"),
+        # --- ID3D11Device1 追加分 (4 メソッド) ---
+        comtypes.STDMETHOD(None,              "GetImmediateContext1"),
+        comtypes.STDMETHOD(comtypes.HRESULT,  "CreateDeferredContext1"),
+        comtypes.STDMETHOD(comtypes.HRESULT,  "OpenSharedResource1",
+            [ctypes.c_void_p,                   # hResource (HANDLE, 自プロセスの複製済みハンドル)
+             ctypes.POINTER(comtypes.GUID),      # returnedInterface (REFIID)
+             ctypes.POINTER(ctypes.c_void_p)]),  # ppResource (void**)
+        comtypes.STDMETHOD(comtypes.HRESULT,  "OpenSharedResourceByName"),
+    ]
+
+
 def _create_d3d11_device():
     """D3D11Device + ImmediateContext を comtypes オブジェクトとして返す"""
     feature_levels = (ctypes.c_uint * 3)(
@@ -331,108 +399,132 @@ def _com_release(obj):
             pass
 
 
+# ─── Win32 DuplicateHandle ヘルパー ──────────────────────────────────────────
+# use_last_error=True を付けて ctypes.get_last_error() が正しく機能するようにする
+_k32 = ctypes.WinDLL('kernel32', use_last_error=True)
+_k32.OpenProcess.restype       = ctypes.c_void_p
+_k32.OpenProcess.argtypes      = [ctypes.c_uint32, ctypes.c_bool, ctypes.c_uint32]
+_k32.GetCurrentProcess.restype = ctypes.c_void_p
+_k32.DuplicateHandle.restype   = ctypes.c_int   # BOOL は 4バイト int
+_k32.DuplicateHandle.argtypes  = [
+    ctypes.c_void_p,  # hSourceProcessHandle
+    ctypes.c_void_p,  # hSourceHandle
+    ctypes.c_void_p,  # hTargetProcessHandle
+    ctypes.POINTER(ctypes.c_void_p),  # lpTargetHandle
+    ctypes.c_uint32,  # dwDesiredAccess
+    ctypes.c_int,     # bInheritHandle (BOOL = int)
+    ctypes.c_uint32,  # dwOptions
+]
+_k32.CloseHandle.restype  = ctypes.c_int
+_k32.CloseHandle.argtypes = [ctypes.c_void_p]
+
+_PROCESS_DUP_HANDLE    = 0x0040
+_DUPLICATE_SAME_ACCESS = 0x00000002
+
+
+def _try_duplicate_handle(src_pid: int, src_handle: int) -> Optional[int]:
+    """src_pid プロセスの src_handle をカレントプロセスに複製して返す。
+    失敗した場合は None を返す（例外は送出しない）。"""
+    src_proc = _k32.OpenProcess(_PROCESS_DUP_HANDLE, False, src_pid)
+    if not src_proc:
+        err = ctypes.get_last_error()
+        print(f"[obscam] OpenProcess(PID={src_pid}) 失敗: LastError={err}")
+        return None
+
+    dup = ctypes.c_void_p(0)
+    ok  = _k32.DuplicateHandle(
+        ctypes.c_void_p(src_proc),
+        ctypes.c_void_p(src_handle),
+        _k32.GetCurrentProcess(),
+        ctypes.byref(dup),
+        0,
+        0,   # bInheritHandle = FALSE
+        _DUPLICATE_SAME_ACCESS,
+    )
+    _k32.CloseHandle(ctypes.c_void_p(src_proc))
+
+    if not ok or not dup.value:
+        err = ctypes.get_last_error()
+        print(f"[obscam] DuplicateHandle(0x{src_handle:08X}) 失敗: LastError={err}")
+        return None
+
+    return dup.value
+
+
 def _open_shared_resource(device, handle: int, src_pid: int = 0):
-    """ID3D11Device::OpenSharedResource / OpenSharedResource1 で共有テクスチャを開く。
+    """共有テクスチャを 3 段階フォールバックで開く。
 
-    OBS game-capture の tex_handle はグローバル共有ハンドルなので
-    DuplicateHandle 不要でそのまま渡せる。
-    上位ビットが立っている場合は DXGI NT ハンドル → OpenSharedResource1 を使う。
+    [試行 1] OpenSharedResource (legacy global handle)
+        → bit31=0 のグローバルハンドルはこれだけで成功する。
+          bit31=1 のハンドルも実体がカーネルグローバルであれば成功することがある。
+
+    [試行 2] OpenSharedResource1 with direct handle
+        → DuplicateHandle 不要のカーネルグローバル NT ハンドル向け。
+          OBS が内部で使っているのもこの方式。
+
+    [試行 3] OpenSharedResource1 with DuplicateHandle
+        → プロセスローカル NT ハンドル向け（CS2 以外のゲームで稀に発生）。
     """
-    is_nt_handle = bool(handle & 0x80000000)
-    raw_handle   = ctypes.c_void_p(handle & 0xFFFFFFFF)
+    raw = ctypes.c_void_p(handle)
 
-    if is_nt_handle:
-        print(f"[obscam] NT共有ハンドル (0x{handle:08X}) → OpenSharedResource1")
+    # ── 試行 1: OpenSharedResource (legacy) ──────────────────────────────────
+    print(f"[obscam] 試行1 OpenSharedResource (handle=0x{handle:08X})")
+    out = ctypes.c_void_p(0)
+    iid = _IID_ID3D11Resource
+    try:
+        hr = device.OpenSharedResource(raw, ctypes.byref(iid), ctypes.byref(out))
+        if hr == S_OK and out.value:
+            print("[obscam] OpenSharedResource 成功")
+            return ctypes.cast(out, ctypes.POINTER(_ID3D11Resource))
+        print(f"[obscam] 試行1 失敗: hr=0x{hr & 0xFFFFFFFF:08X}")
+    except Exception as e:
+        print(f"[obscam] 試行1 例外: {e}")
 
-        # ID3D11Device1 を IUnknown から直接定義
-        # vtable: QI/AddRef/Release + ID3D11Device(23) + GetImmCtx1/CreateDeferred1/OpenSharedResource1/OpenSharedResourceByName
-        class _ID3D11Device1(comtypes.IUnknown):
-            _iid_ = comtypes.GUID("{a04bfb29-08ef-43d6-a49c-a9bdbdcbe686}")
-            _methods_ = (
-                # --- ID3D11Device (23 methods) ---
-                comtypes.STDMETHOD(comtypes.HRESULT, "CreateBuffer"),
-                comtypes.STDMETHOD(comtypes.HRESULT, "CreateTexture1D"),
-                comtypes.STDMETHOD(comtypes.HRESULT, "CreateTexture2D"),
-                comtypes.STDMETHOD(comtypes.HRESULT, "CreateTexture3D"),
-                comtypes.STDMETHOD(comtypes.HRESULT, "CreateShaderResourceView"),
-                comtypes.STDMETHOD(comtypes.HRESULT, "CreateUnorderedAccessView"),
-                comtypes.STDMETHOD(comtypes.HRESULT, "CreateRenderTargetView"),
-                comtypes.STDMETHOD(comtypes.HRESULT, "CreateDepthStencilView"),
-                comtypes.STDMETHOD(comtypes.HRESULT, "CreateInputLayout"),
-                comtypes.STDMETHOD(comtypes.HRESULT, "CreateVertexShader"),
-                comtypes.STDMETHOD(comtypes.HRESULT, "CreateGeometryShader"),
-                comtypes.STDMETHOD(comtypes.HRESULT, "CreateGeometryShaderWithStreamOutput"),
-                comtypes.STDMETHOD(comtypes.HRESULT, "CreatePixelShader"),
-                comtypes.STDMETHOD(comtypes.HRESULT, "CreateHullShader"),
-                comtypes.STDMETHOD(comtypes.HRESULT, "CreateDomainShader"),
-                comtypes.STDMETHOD(comtypes.HRESULT, "CreateComputeShader"),
-                comtypes.STDMETHOD(comtypes.HRESULT, "CreateClassLinkage"),
-                comtypes.STDMETHOD(comtypes.HRESULT, "CreateBlendState"),
-                comtypes.STDMETHOD(comtypes.HRESULT, "CreateDepthStencilState"),
-                comtypes.STDMETHOD(comtypes.HRESULT, "CreateRasterizerState"),
-                comtypes.STDMETHOD(comtypes.HRESULT, "CreateSamplerState"),
-                comtypes.STDMETHOD(comtypes.HRESULT, "CreateQuery"),
-                comtypes.STDMETHOD(comtypes.HRESULT, "CreatePredicate"),
-                comtypes.STDMETHOD(comtypes.HRESULT, "CreateCounter"),
-                comtypes.STDMETHOD(comtypes.HRESULT, "CreateDeferredContext"),
-                comtypes.STDMETHOD(comtypes.HRESULT, "OpenSharedResource"),
-                comtypes.STDMETHOD(comtypes.HRESULT, "CheckFormatSupport"),
-                comtypes.STDMETHOD(comtypes.HRESULT, "CheckMultisampleQualityLevels"),
-                comtypes.STDMETHOD(None,              "CheckCounterInfo"),
-                comtypes.STDMETHOD(comtypes.HRESULT, "CheckCounter"),
-                comtypes.STDMETHOD(comtypes.HRESULT, "CheckFeatureSupport"),
-                comtypes.STDMETHOD(comtypes.HRESULT, "GetPrivateData"),
-                comtypes.STDMETHOD(comtypes.HRESULT, "SetPrivateData"),
-                comtypes.STDMETHOD(comtypes.HRESULT, "SetPrivateDataInterface"),
-                comtypes.STDMETHOD(None,              "GetFeatureLevel"),
-                comtypes.STDMETHOD(None,              "GetCreationFlags"),
-                comtypes.STDMETHOD(comtypes.HRESULT, "GetDeviceRemovedReason"),
-                comtypes.STDMETHOD(None,              "GetImmediateContext"),
-                comtypes.STDMETHOD(comtypes.HRESULT, "SetExceptionMode"),
-                comtypes.STDMETHOD(None,              "GetExceptionMode"),
-                # --- ID3D11Device1 追加分 ---
-                comtypes.STDMETHOD(None,              "GetImmediateContext1"),
-                comtypes.STDMETHOD(comtypes.HRESULT,  "CreateDeferredContext1"),
-                comtypes.STDMETHOD(comtypes.HRESULT,  "OpenSharedResource1",
-                    [ctypes.c_void_p,
-                     ctypes.POINTER(comtypes.GUID),
-                     ctypes.POINTER(ctypes.c_void_p)]),
-                comtypes.STDMETHOD(comtypes.HRESULT,  "OpenSharedResourceByName"),
-            )
+    # ── 試行 2: OpenSharedResource1 ハンドル直接渡し ─────────────────────────
+    # bit31=1 のカーネルグローバルハンドル（0xC0xxxxxx など）はDuplicateHandle
+    # できないが、そのまま OpenSharedResource1 に渡せば動く（OBS と同じ動作）。
+    print(f"[obscam] 試行2 OpenSharedResource1 直接 (handle=0x{handle:08X})")
+    try:
+        dev1 = device.QueryInterface(_ID3D11Device1)
+        out2 = ctypes.c_void_p(0)
+        iid2 = _IID_ID3D11Resource
+        hr = dev1.OpenSharedResource1(raw, ctypes.byref(iid2), ctypes.byref(out2))
+        if hr == S_OK and out2.value:
+            print("[obscam] OpenSharedResource1 (直接) 成功")
+            return ctypes.cast(out2, ctypes.POINTER(_ID3D11Resource))
+        print(f"[obscam] 試行2 失敗: hr=0x{hr & 0xFFFFFFFF:08X}")
+    except Exception as e:
+        print(f"[obscam] 試行2 例外: {e}")
 
-        try:
-            dev1 = device.QueryInterface(_ID3D11Device1)
-        except Exception as e:
-            raise RuntimeError(f"QI ID3D11Device1 失敗: {e}")
+    # ── 試行 3: OpenSharedResource1 + DuplicateHandle ────────────────────────
+    # プロセスローカル NT ハンドルの場合、先に複製が必要。
+    if src_pid:
+        print(f"[obscam] 試行3 OpenSharedResource1 + DuplicateHandle (pid={src_pid})")
+        local_handle = _try_duplicate_handle(src_pid, handle)
+        if local_handle:
+            try:
+                dev1 = device.QueryInterface(_ID3D11Device1)
+                out3 = ctypes.c_void_p(0)
+                iid3 = _IID_ID3D11Resource
+                hr = dev1.OpenSharedResource1(
+                    ctypes.c_void_p(local_handle),
+                    ctypes.byref(iid3),
+                    ctypes.byref(out3),
+                )
+                if hr == S_OK and out3.value:
+                    print("[obscam] OpenSharedResource1 (DuplicateHandle) 成功")
+                    return ctypes.cast(out3, ctypes.POINTER(_ID3D11Resource))
+                print(f"[obscam] 試行3 失敗: hr=0x{hr & 0xFFFFFFFF:08X}")
+            except Exception as e:
+                print(f"[obscam] 試行3 例外: {e}")
+            finally:
+                _k32.CloseHandle(ctypes.c_void_p(local_handle))
+        else:
+            print("[obscam] 試行3 スキップ (DuplicateHandle 失敗)")
 
-        out = ctypes.c_void_p(0)
-        iid = _IID_ID3D11Resource
-        try:
-            hr = dev1.OpenSharedResource1(
-                raw_handle,
-                ctypes.byref(iid),
-                ctypes.byref(out),
-            )
-        except Exception as e:
-            raise RuntimeError(f"OpenSharedResource1 呼び出し例外: {e}")
-        if hr != S_OK:
-            raise RuntimeError(f"OpenSharedResource1 失敗: hr=0x{hr & 0xFFFFFFFF:08X}")
-        print(f"[obscam] OpenSharedResource1 成功")
-        return ctypes.cast(out, ctypes.POINTER(_ID3D11Resource))
-
-    else:
-        print(f"[obscam] 通常共有ハンドル (0x{handle:08X}) → OpenSharedResource")
-        out = ctypes.c_void_p(0)
-        iid = _IID_ID3D11Resource
-        hr  = device.OpenSharedResource(
-            raw_handle,
-            ctypes.byref(iid),
-            ctypes.byref(out),
-        )
-        if hr != S_OK:
-            raise RuntimeError(f"OpenSharedResource 失敗: hr=0x{hr & 0xFFFFFFFF:08X}")
-        print(f"[obscam] OpenSharedResource 成功")
-        return ctypes.cast(out, ctypes.POINTER(_ID3D11Resource))
+    raise RuntimeError(
+        f"全ての OpenSharedResource 手法が失敗: handle=0x{handle:08X}"
+    )
 
 
 def _create_staging_texture(device, width: int, height: int, fmt: int = DXGI_FORMAT_B8G8R8A8_UNORM):
@@ -842,7 +934,9 @@ class ObsCam:
 
             handle = int(self._shtex.tex_handle)
             try:
-                self._shared_res = _open_shared_resource(self._device, handle, src_pid=self._pid)
+                self._shared_res = _open_shared_resource(
+                    self._device, handle, src_pid=self._pid
+                )
                 return
             except RuntimeError as e:
                 print(f"[obscam] OpenSharedResource 失敗 (attempt {attempt+1}): {e}")
