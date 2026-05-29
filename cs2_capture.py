@@ -54,12 +54,12 @@ import obscam
 # ─── 設定 ────────────────────────────────────────────────────────────────────
 
 OBS_DIR       = r"C:\Program Files\obs-studio\data\obs-plugins\win-capture"
-GAME_TITLE    = "Counter-Strike 2"
+GAME_TITLE    = "VALORANT  "
 SCREEN_WIDTH  = 1920
 SCREEN_HEIGHT = 1080
 FOV_WIDTH     = 416
 FOV_HEIGHT    = 416
-TARGET_FPS    = 240
+TARGET_FPS    = 400
 
 # ─── メイン ──────────────────────────────────────────────────────────────────
 
@@ -73,10 +73,10 @@ def main():
         screen_width  = SCREEN_WIDTH,
         screen_height = SCREEN_HEIGHT,
         obs_dir       = OBS_DIR,
-        cuda          = True,
     )
     print(cam)
-    cam.start(target_fps=TARGET_FPS)
+    # start() は使わず grab() をメインループで直接呼ぶ
+    # → _frame_event の待機問題を回避し、常に最新フレームを表示できる
 
     # ── pygame 初期化 ──────────────────────────────────────────────────────────
     pygame.init()
@@ -89,6 +89,7 @@ def main():
     frame_count = 0
     t0          = time.perf_counter()
     display_fps = 0.0
+    last_surf   = None  # ミューテックス取得失敗時に前フレームを表示
 
     print("[viewer] 表示開始 (Esc / Q で終了)")
 
@@ -103,37 +104,33 @@ def main():
                         return
 
             # ── フレーム取得 ──────────────────────────────────────────────────
-            frame = cam.get_latest_frame(timeout=0.05)
-            if frame is None:
-                clock.tick(60)
-                continue
+            frame = cam.grab()
 
-            # BGR (CUDA/CPU) → RGB numpy → pygame Surface
-            # frame: [H, W, 3] uint8 BGR
-            rgb = torch.flip(frame, dims=[-1])  # BGR → RGB
-            if rgb.is_cuda:
-                rgb = rgb.cpu()             # GPU → CPU
-            arr = rgb.numpy()               # torch → numpy (コピーなし)
+            if frame is not None:
+                # BGR (CUDA/CPU) → RGB numpy → pygame Surface
+                rgb = torch.flip(frame, dims=[-1])  # BGR → RGB
+                if rgb.is_cuda:
+                    rgb = rgb.cpu()
+                arr  = rgb.numpy()
+                last_surf = pygame.surfarray.make_surface(arr.transpose(1, 0, 2))
+                frame_count += 1
 
-            # pygame.surfarray は [W, H, 3] を期待するので転置
-            surf = pygame.surfarray.make_surface(arr.transpose(1, 0, 2))
-            screen.blit(surf, (0, 0))
+            if last_surf is not None:
+                screen.blit(last_surf, (0, 0))
 
-            # ── FPS オーバーレイ ──────────────────────────────────────────────
-            frame_count += 1
-            elapsed = time.perf_counter() - t0
-            if elapsed >= 0.5:
-                display_fps = frame_count / elapsed
-                frame_count = 0
-                t0          = time.perf_counter()
+                # ── FPS オーバーレイ ──────────────────────────────────────────
+                elapsed = time.perf_counter() - t0
+                if elapsed >= 0.5:
+                    display_fps = frame_count / elapsed
+                    frame_count = 0
+                    t0          = time.perf_counter()
 
-            fps_text = (
-                f"display: {display_fps:5.1f} fps  "
-                f"capture: {cam.capture_fps:5.1f} fps  "
-                f"mode: {cam.mode}"
-            )
-            label = font.render(fps_text, True, (0, 255, 0), (0, 0, 0))
-            screen.blit(label, (8, 8))
+                fps_text = (
+                    f"display: {display_fps:5.1f} fps  "
+                    f"mode: {cam.mode}"
+                )
+                label = font.render(fps_text, True, (0, 255, 0), (0, 0, 0))
+                screen.blit(label, (8, 8))
 
             pygame.display.flip()
             clock.tick(TARGET_FPS)
