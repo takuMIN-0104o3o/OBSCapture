@@ -49,70 +49,6 @@ from .libs import (
     wait_for_single_object, create_process, get_exit_code_process,
 )
 
-# ─── CUDA Runtime ─────────────────────────────────────────────────────────────
-import glob as _glob
-
-_CUDA_AVAILABLE = False
-_cudart = None
-
-
-def _load_cudart():
-    candidates = [
-        r"C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.6\bin\cudart64_12.dll",
-        r"C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.0\bin\cudart64_12.dll",
-    ]
-    for pattern in [
-        r"C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v*\bin\cudart64_*.dll",
-        r"C:\Windows\System32\cudart64_*.dll",
-    ]:
-        candidates += _glob.glob(pattern)
-    for path in candidates:
-        if os.path.exists(path):
-            try:
-                return ctypes.CDLL(path)
-            except OSError:
-                continue
-    return None
-
-
-_cudart = _load_cudart()
-if _cudart is not None:
-    _cudart.cudaGraphicsD3D11RegisterResource.restype  = ctypes.c_int
-    _cudart.cudaGraphicsD3D11RegisterResource.argtypes = [
-        ctypes.POINTER(ctypes.c_void_p),
-        ctypes.c_void_p,
-        ctypes.c_uint,
-    ]
-    _cudart.cudaGraphicsMapResources.restype  = ctypes.c_int
-    _cudart.cudaGraphicsMapResources.argtypes = [
-        ctypes.c_int, ctypes.POINTER(ctypes.c_void_p), ctypes.c_void_p,
-    ]
-    _cudart.cudaGraphicsUnmapResources.restype  = ctypes.c_int
-    _cudart.cudaGraphicsUnmapResources.argtypes = [
-        ctypes.c_int, ctypes.POINTER(ctypes.c_void_p), ctypes.c_void_p,
-    ]
-    _cudart.cudaGraphicsResourceGetMappedMipmappedArray.restype  = ctypes.c_int
-    _cudart.cudaGraphicsResourceGetMappedMipmappedArray.argtypes = [
-        ctypes.POINTER(ctypes.c_void_p), ctypes.c_void_p,
-    ]
-    _cudart.cudaGetMipmappedArrayLevel.restype  = ctypes.c_int
-    _cudart.cudaGetMipmappedArrayLevel.argtypes = [
-        ctypes.POINTER(ctypes.c_void_p), ctypes.c_void_p, ctypes.c_uint,
-    ]
-    _cudart.cudaMemcpy2DFromArray.restype  = ctypes.c_int
-    _cudart.cudaMemcpy2DFromArray.argtypes = [
-        ctypes.c_void_p, ctypes.c_size_t,
-        ctypes.c_void_p,
-        ctypes.c_size_t, ctypes.c_size_t,
-        ctypes.c_size_t, ctypes.c_size_t,
-        ctypes.c_int,
-    ]
-    _cudart.cudaGraphicsUnregisterResource.restype  = ctypes.c_int
-    _cudart.cudaGraphicsUnregisterResource.argtypes = [ctypes.c_void_p]
-    _CUDA_AVAILABLE = True
-
-_CUDA_GRAPHICS_REGISTER_FLAGS_NONE = 0
-_CUDA_MEMCPY_DEVICE_TO_DEVICE      = 3
 
 # ─── D3D11 COM (comtypes 経由) ────────────────────────────────────────────────
 import comtypes
@@ -642,7 +578,6 @@ class ObsCam:
         screen_width: int,
         screen_height: int,
         obs_dir: str = "obs_stuff",
-        cuda: bool = True,
     ):
         self.game_title    = game_title
         self._roi_w        = fov_width
@@ -650,8 +585,6 @@ class ObsCam:
         self._screen_w     = screen_width
         self._screen_h     = screen_height
         self._obs_dir      = obs_dir
-        cuda_avail = torch.cuda.is_available()
-        self.cuda  = cuda and cuda_avail
 
         # ハンドル類
         self._hwnd         = 0
@@ -678,11 +611,8 @@ class ObsCam:
         self._staging_tex    = ctypes.c_void_p(0)
         self._roi_box        = D3D11_BOX()
 
-        # CUDA interop
-        self._interop        = False
-        self._cuda_res       = None
-        self._gpu_buf        = None
-        self._gpu_ptr        = None
+        # ピン留めバッファ（_to_tensor_cpu で再利用し確保コストを排除）
+        self._pinned_buf: Optional[torch.Tensor] = None
 
         # 連続キャプチャ
         self._latest: Optional[torch.Tensor] = None
@@ -819,10 +749,6 @@ class ObsCam:
             self._device, self._roi_w, self._roi_h, fmt=shared_fmt
         )
         self._roi_box = self._calc_roi_box()
-
-        # 15. CUDA interop 試行
-        if self.cuda and _CUDA_AVAILABLE:
-            self._init_cuda_interop()
 
         print(f"[obscam] 初期化完了  mode={self.mode}  "
               f"ROI={self._roi_w}x{self._roi_h}")
@@ -962,36 +888,6 @@ class ObsCam:
         box.back   = 1
         return box
 
-    # ── CUDA interop ──────────────────────────────────────────────────────────
-
-    def _init_cuda_interop(self):
-        try:
-            cuda_res = ctypes.c_void_p(0)
-            tex_ptr  = self._staging_tex  # staging を interop に使う
-
-            # GPU バッファ確保（先に torch を初期化しておく）
-            self._gpu_buf = torch.empty(
-                (self._roi_h, self._roi_w, 4), dtype=torch.uint8, device="cuda"
-            )
-            self._gpu_ptr = self._gpu_buf.data_ptr()
-
-            err = _cudart.cudaGraphicsD3D11RegisterResource(
-                ctypes.byref(cuda_res),
-                ctypes.c_void_p(tex_ptr.value),
-                _CUDA_GRAPHICS_REGISTER_FLAGS_NONE,
-            )
-            if err != 0:
-                raise RuntimeError(f"cudaGraphicsD3D11RegisterResource: err={err}")
-
-            self._cuda_res = cuda_res
-            self._interop  = True
-            print("[obscam] モード: CUDA interop (GPU→GPU)")
-        except Exception as e:
-            print(f"[obscam] CUDA interop 失敗 → CPU フォールバック: {e}")
-            self._interop  = False
-            self._gpu_buf  = None
-            self._gpu_ptr  = None
-
     # ── フレーム取得 ──────────────────────────────────────────────────────────
 
     def grab(self) -> Optional[torch.Tensor]:
@@ -1007,22 +903,7 @@ class ObsCam:
         # GPU 上で ROI をコピー（共有リソース → ステージング or interop テクスチャ）
         dst = self._staging_tex
 
-        # デバッグ: shared_res の desc を確認（初回のみ）
-        if not getattr(self, '_dbg_desc_printed', False):
-            try:
-                tex2d = self._shared_res.QueryInterface(_ID3D11Texture2D)
-                desc  = D3D11_TEXTURE2D_DESC()
-                tex2d.GetDesc(ctypes.byref(desc))
-                print(f"[obscam][DBG] shared_res desc: "
-                      f"{desc.Width}x{desc.Height} fmt={desc.Format} "
-                      f"usage={desc.Usage} misc={desc.MiscFlags:#010x}")
-                self._tex2d_shared = tex2d
-            except Exception as e:
-                print(f"[obscam][DBG] shared_res QI Texture2D 失敗: {e}")
-            self._dbg_desc_printed = True
-
         # texture_mutex でロックしてからコピー（OBS と同じプロトコル）
-        # tex_mutex[0] or [1] を取得できた方でコピーする
         locked_idx = -1
         for i, mx in enumerate(self._tex_mutex):
             if not mx:
@@ -1033,79 +914,27 @@ class ObsCam:
                 break
 
         if locked_idx == -1:
-            # どちらのミューテックスも取れない場合はスキップ（次フレームで再試行）
             return None
 
         try:
             _copy_subresource_region(
                 self._ctx, dst, self._shared_res, self._roi_box
             )
+            # Flush は非同期コマンドをGPUに送るだけで、CPU はブロックしない。
+            # 次フレームで Map するまでに GPU が完了している前提（通常は十分間に合う）。
             self._ctx.Flush()
         except Exception as e:
             print(f"[obscam] CopySubresourceRegion 失敗: {e}")
             return None
         finally:
-            # ミューテックスを解放
             ctypes.windll.kernel32.ReleaseMutex(
                 ctypes.c_void_p(self._tex_mutex[locked_idx])
             )
 
-        if self._interop and self._cuda_res is not None:
-            return self._to_tensor_cuda()
-        else:
-            return self._to_tensor_cpu()
-
-    def _to_tensor_cuda(self) -> Optional[torch.Tensor]:
-        """GPU → GPU 直接転送"""
-        cu_res_arr = (ctypes.c_void_p * 1)(self._cuda_res.value)
-
-        err = _cudart.cudaGraphicsMapResources(
-            1, cu_res_arr, None
-        )
-        if err != 0:
-            print(f"[obscam] cudaGraphicsMapResources 失敗: {err}")
-            return None
-
-        try:
-            mip_arr  = ctypes.c_void_p(0)
-            cuda_arr = ctypes.c_void_p(0)
-
-            err = _cudart.cudaGraphicsResourceGetMappedMipmappedArray(
-                ctypes.byref(mip_arr), self._cuda_res
-            )
-            if err != 0:
-                raise RuntimeError(f"GetMappedMipmappedArray: err={err}")
-
-            err = _cudart.cudaGetMipmappedArrayLevel(
-                ctypes.byref(cuda_arr), mip_arr, 0
-            )
-            if err != 0:
-                raise RuntimeError(f"cudaGetMipmappedArrayLevel: err={err}")
-
-            row_bytes = self._roi_w * 4
-            err = _cudart.cudaMemcpy2DFromArray(
-                ctypes.c_void_p(self._gpu_ptr),
-                ctypes.c_size_t(row_bytes),
-                cuda_arr,
-                ctypes.c_size_t(0),
-                ctypes.c_size_t(0),
-                ctypes.c_size_t(row_bytes),
-                ctypes.c_size_t(self._roi_h),
-                ctypes.c_int(_CUDA_MEMCPY_DEVICE_TO_DEVICE),
-            )
-            if err != 0:
-                raise RuntimeError(f"cudaMemcpy2DFromArray: err={err}")
-
-        except RuntimeError as e:
-            print(f"[obscam] CUDA コピー失敗: {e}")
-            return None
-        finally:
-            _cudart.cudaGraphicsUnmapResources(1, cu_res_arr, None)
-
-        return self._gpu_buf[..., :3]  # BGRA → BGR (ゼロコピー)
+        return self._to_tensor_cpu()
 
     def _to_tensor_cpu(self) -> Optional[torch.Tensor]:
-        """CPU 経由フォールバック"""
+        """CPU 経由フォールバック（ゼロコピー + 非同期CUDA転送）"""
         try:
             mapped = _map_texture(self._ctx, self._staging_tex)
         except RuntimeError as e:
@@ -1113,34 +942,52 @@ class ObsCam:
             return None
 
         try:
-            buf = (ctypes.c_uint8 * (mapped.RowPitch * self._roi_h)).from_address(
-                mapped.pData
-            )
-            t = torch.frombuffer(bytearray(buf), dtype=torch.uint8).reshape(
-                self._roi_h, mapped.RowPitch // 4, 4
-            )
-            if mapped.RowPitch // 4 != self._roi_w:
-                t = t[:, :self._roi_w, :]
+            row_w = mapped.RowPitch // 4   # BGRA → 4 bytes/px
 
-            # fmt=27 (RGBA) → BGR,  fmt=87 (BGRA) → BGR
-            DXGI_FORMAT_R8G8B8A8_UNORM = 28
-            if getattr(self, '_shared_fmt', DXGI_FORMAT_B8G8R8A8_UNORM) in (27, 28):
-                # RGBA → BGR: チャンネル順を R,G,B → B,G,R に入れ替え
-                t = t[..., [2, 1, 0]].clone()
+            # ── ゼロコピー: Map済みアドレスを直接 torch に見せる ──────────────
+            # bytearray(buf) によるCPUコピーを排除。
+            # torch.frombuffer は外部メモリへの参照を保持するので
+            # Unmap 前に必ず contiguous clone するか CUDA 転送する。
+            raw = torch.frombuffer(
+                (ctypes.c_uint8 * (mapped.RowPitch * self._roi_h))
+                .from_address(mapped.pData),
+                dtype=torch.uint8,
+            ).reshape(self._roi_h, row_w, 4)
+
+            if row_w != self._roi_w:
+                raw = raw[:, :self._roi_w, :]
+
+            # ── ピン留めバッファ経由で非同期CUDA転送 ─────────────────────────
+            # _pinned_buf はフレームサイズが変わらない限り再利用する。
+            if torch.cuda.is_available():
+                need_channels = 3
+                h, w = self._roi_h, self._roi_w
+                if (self._pinned_buf is None
+                        or self._pinned_buf.shape != (h, w, need_channels)):
+                    self._pinned_buf = torch.empty(
+                        (h, w, need_channels), dtype=torch.uint8
+                    ).pin_memory()
+
+                # BGRA→BGR or RGBA→BGR をCPU側で確定してからピン留め先へ書く
+                DXGI_FORMAT_R8G8B8A8_UNORM = 28
+                if getattr(self, '_shared_fmt', DXGI_FORMAT_B8G8R8A8_UNORM) in (27, 28):
+                    self._pinned_buf.copy_(raw[..., [2, 1, 0]])  # RGBA→BGR
+                else:
+                    self._pinned_buf.copy_(raw[..., :3])         # BGRA→BGR
+
+                # non_blocking=True で CPU をブロックせずに転送開始
+                t = self._pinned_buf.to("cuda", non_blocking=True)
             else:
-                # BGRA → BGR
-                t = t[..., :3].clone()
+                # CUDA なし: clone して Map を解放できるようにする
+                DXGI_FORMAT_R8G8B8A8_UNORM = 28
+                if getattr(self, '_shared_fmt', DXGI_FORMAT_B8G8R8A8_UNORM) in (27, 28):
+                    t = raw[..., [2, 1, 0]].clone()
+                else:
+                    t = raw[..., :3].clone()
 
-            # デバッグ: 最初のフレームのみ
-            if not getattr(self, '_dbg_printed', False):
-                print(f"[obscam][DBG] frame max={t.max().item()}  mean={t.float().mean().item():.1f}  "
-                      f"RowPitch={mapped.RowPitch}  fmt={getattr(self,'_shared_fmt','?')}")
-                self._dbg_printed = True
         finally:
             _unmap_texture(self._ctx, self._staging_tex)
 
-        if self.cuda:
-            t = t.to("cuda", non_blocking=True)
         return t
 
     # ── 連続キャプチャ ────────────────────────────────────────────────────────
@@ -1182,9 +1029,9 @@ class ObsCam:
         return self._latest
 
     def _capture_loop(self, target_fps: float):
-        interval = 1.0 / target_fps
-        count    = 0
-        t_start  = time.perf_counter()
+        interval  = 1.0 / target_fps
+        count     = 0
+        t_start   = time.perf_counter()
 
         while not self._stop_event.is_set():
             t0    = time.perf_counter()
@@ -1195,15 +1042,19 @@ class ObsCam:
                 count += 1
 
             elapsed_total = time.perf_counter() - t_start
-            if elapsed_total >= 0.5:
+            if elapsed_total >= 1.0:   # 1秒ごとにFPS更新（0.5秒では計測が荒い）
                 self._capture_fps = count / elapsed_total
                 count   = 0
                 t_start = time.perf_counter()
 
-            # 残り時間スリープ
+            # 高精度スリープ: 残り時間の大半を sleep で返し、最後の2ms をビジーウェイト
             spent = time.perf_counter() - t0
-            if spent < interval:
-                time.sleep(interval - spent)
+            remaining = interval - spent
+            if remaining > 0.002:
+                time.sleep(remaining - 0.002)
+            # ビジーウェイト（最後の2msを精度よく待機）
+            while time.perf_counter() - t0 < interval:
+                pass
 
     @property
     def capture_fps(self) -> float:
@@ -1211,18 +1062,14 @@ class ObsCam:
 
     @property
     def mode(self) -> str:
-        return "cuda_interop" if self._interop else "cpu_fallback"
+        return "cpu_fallback"
 
     # ── クリーンアップ ────────────────────────────────────────────────────────
 
     def release(self):
         self.stop()
 
-        if self._cuda_res is not None:
-            try:
-                _cudart.cudaGraphicsUnregisterResource(self._cuda_res)
-            except Exception:
-                pass
+        self._pinned_buf = None  # ピン留めメモリを解放
 
         for ptr in [self._staging_tex, self._shared_res, self._ctx, self._device]:
             _com_release(ptr)
