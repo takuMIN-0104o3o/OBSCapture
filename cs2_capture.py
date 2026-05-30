@@ -54,7 +54,7 @@ import obscam
 # ─── 設定 ────────────────────────────────────────────────────────────────────
 
 OBS_DIR       = r"C:\Program Files\obs-studio\data\obs-plugins\win-capture"
-GAME_TITLE    = "VALORANT  "
+GAME_TITLE    = "Counter-Strike 2"
 SCREEN_WIDTH  = 1920
 SCREEN_HEIGHT = 1080
 FOV_WIDTH     = 416
@@ -66,7 +66,7 @@ TARGET_FPS    = 400
 def main():
     # ── obscam 初期化 ──────────────────────────────────────────────────────────
     print("[viewer] obscam 初期化中...")
-    cam = obscam.create(
+    cam = obscam.ObsCam(
         game_title    = GAME_TITLE,
         fov_width     = FOV_WIDTH,
         fov_height    = FOV_HEIGHT,
@@ -85,10 +85,10 @@ def main():
     font  = pygame.font.SysFont("consolas", 18)
     clock = pygame.time.Clock()
 
-    # FPS 計測用
+    # FPS 計測用（取得フレームレート）
     frame_count = 0
     t0          = time.perf_counter()
-    display_fps = 0.0
+    capture_fps = 0.0
     last_surf   = None  # ミューテックス取得失敗時に前フレームを表示
 
     print("[viewer] 表示開始 (Esc / Q で終了)")
@@ -118,17 +118,15 @@ def main():
             if last_surf is not None:
                 screen.blit(last_surf, (0, 0))
 
-                # ── FPS オーバーレイ ──────────────────────────────────────────
+                # ── FPS オーバーレイ（取得フレームレートのみ表示）──────────────────
                 elapsed = time.perf_counter() - t0
                 if elapsed >= 0.5:
-                    display_fps = frame_count / elapsed
+                    capture_fps = frame_count / elapsed
                     frame_count = 0
                     t0          = time.perf_counter()
 
-                fps_text = (
-                    f"display: {display_fps:5.1f} fps  "
-                    f"mode: {cam.mode}"
-                )
+                # 「display:」なしで fps のみ表示
+                fps_text = f"{capture_fps:5.1f} fps  ({cam.mode})"
                 label = font.render(fps_text, True, (0, 255, 0), (0, 0, 0))
                 screen.blit(label, (8, 8))
 
