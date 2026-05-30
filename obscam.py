@@ -18,6 +18,22 @@ C++ の GameCapture クラスを Python + ctypes で完全再実装。
     - NT ハンドル (bit31=1) は DuplicateHandle でカレントプロセスへ複製してから使用
       （ゲームプロセスのハンドルを直接 OpenSharedResource1 に渡すとアクセス違反）
     - D3D11CreateDevice の restype を明示設定
+
+修正点 (2025-06 rev2):
+    - hook_restart 無限ループ修正:
+        * _reinitializing フラグで再初期化中の二重実行を防止
+        * _initialize() 末尾で hook_restart イベントを空読みリセット
+    - map_size=4 異常値ガード: 1024 未満のときは無効データとして待機継続
+    - _release_d3d_resources() を切り出して再初期化時のリーク防止
+
+修正点 (2025-06 rev3):
+    - hook_restart ループ根本修正:
+        * _initialize() のステップ7で hook_restart ハンドルを閉じて再オープン
+          （古いハンドルへのリセットで新しい restart イベントを見逃す問題を修正）
+        * _initialize() 末尾で hook_restart を最大3回空読みして複数キューを全消費
+        * grab() の再初期化後に 0.5s の安定待ちを追加
+    - _grab() のテクスチャミューテックス取得タイムアウトを 0ms → 8ms に変更
+      （CS2 描画中は 0ms だとほぼ毎フレーム取得失敗して 0.9fps になる問題を修正）
 """
 from __future__ import annotations
 
@@ -56,7 +72,7 @@ import comtypes.client
 
 _d3d11 = ctypes.windll.d3d11
 
-# [修正③] D3D11CreateDevice の restype を明示設定（未設定だと再試行時にクラッシュすることがある）
+# D3D11CreateDevice の restype を明示設定（未設定だと再試行時にクラッシュすることがある）
 _d3d11.D3D11CreateDevice.restype = ctypes.c_long
 
 # IID
@@ -243,10 +259,7 @@ class _ID3D11Device(comtypes.IUnknown):
     ]
 
 
-# [修正①] _ID3D11Device1 をモジュールレベルに移動
-# 元のコードは _open_shared_resource 関数の内部で毎回クラスを再定義していた。
-# comtypes は IID をキーにインターフェースをキャッシュするため、
-# 同一 IID のクラスを再定義するとキャッシュ衝突が起き vtable が壊れる。
+# _ID3D11Device1 をモジュールレベルに定義（関数内再定義による comtypes 型破壊を防止）
 class _ID3D11Device1(comtypes.IUnknown):
     _iid_ = comtypes.GUID("{a04bfb29-08ef-43d6-a49c-a9bdbdcbe686}")
     _methods_ = [
@@ -324,32 +337,30 @@ def _create_d3d11_device():
 def _com_release(obj):
     if obj is not None:
         try:
-            # comtypes ポインタの場合は中身が NULL でないか確認してから Release
             if hasattr(obj, 'contents'):
                 try:
                     _ = obj.contents
                 except (ValueError, OSError):
-                    return  # NULL ポインタ → スキップ
+                    return
             obj.Release()
         except Exception:
             pass
 
 
 # ─── Win32 DuplicateHandle ヘルパー ──────────────────────────────────────────
-# use_last_error=True を付けて ctypes.get_last_error() が正しく機能するようにする
 _k32 = ctypes.WinDLL('kernel32', use_last_error=True)
 _k32.OpenProcess.restype       = ctypes.c_void_p
 _k32.OpenProcess.argtypes      = [ctypes.c_uint32, ctypes.c_bool, ctypes.c_uint32]
 _k32.GetCurrentProcess.restype = ctypes.c_void_p
-_k32.DuplicateHandle.restype   = ctypes.c_int   # BOOL は 4バイト int
+_k32.DuplicateHandle.restype   = ctypes.c_int
 _k32.DuplicateHandle.argtypes  = [
-    ctypes.c_void_p,  # hSourceProcessHandle
-    ctypes.c_void_p,  # hSourceHandle
-    ctypes.c_void_p,  # hTargetProcessHandle
-    ctypes.POINTER(ctypes.c_void_p),  # lpTargetHandle
-    ctypes.c_uint32,  # dwDesiredAccess
-    ctypes.c_int,     # bInheritHandle (BOOL = int)
-    ctypes.c_uint32,  # dwOptions
+    ctypes.c_void_p,
+    ctypes.c_void_p,
+    ctypes.c_void_p,
+    ctypes.POINTER(ctypes.c_void_p),
+    ctypes.c_uint32,
+    ctypes.c_int,
+    ctypes.c_uint32,
 ]
 _k32.CloseHandle.restype  = ctypes.c_int
 _k32.CloseHandle.argtypes = [ctypes.c_void_p]
@@ -374,7 +385,7 @@ def _try_duplicate_handle(src_pid: int, src_handle: int) -> Optional[int]:
         _k32.GetCurrentProcess(),
         ctypes.byref(dup),
         0,
-        0,   # bInheritHandle = FALSE
+        0,
         _DUPLICATE_SAME_ACCESS,
     )
     _k32.CloseHandle(ctypes.c_void_p(src_proc))
@@ -391,15 +402,8 @@ def _open_shared_resource(device, handle: int, src_pid: int = 0):
     """共有テクスチャを 3 段階フォールバックで開く。
 
     [試行 1] OpenSharedResource (legacy global handle)
-        → bit31=0 のグローバルハンドルはこれだけで成功する。
-          bit31=1 のハンドルも実体がカーネルグローバルであれば成功することがある。
-
     [試行 2] OpenSharedResource1 with direct handle
-        → DuplicateHandle 不要のカーネルグローバル NT ハンドル向け。
-          OBS が内部で使っているのもこの方式。
-
     [試行 3] OpenSharedResource1 with DuplicateHandle
-        → プロセスローカル NT ハンドル向け（CS2 以外のゲームで稀に発生）。
     """
     raw = ctypes.c_void_p(handle)
 
@@ -417,8 +421,6 @@ def _open_shared_resource(device, handle: int, src_pid: int = 0):
         print(f"[obscam] 試行1 例外: {e}")
 
     # ── 試行 2: OpenSharedResource1 ハンドル直接渡し ─────────────────────────
-    # bit31=1 のカーネルグローバルハンドル（0xC0xxxxxx など）はDuplicateHandle
-    # できないが、そのまま OpenSharedResource1 に渡せば動く（OBS と同じ動作）。
     print(f"[obscam] 試行2 OpenSharedResource1 直接 (handle=0x{handle:08X})")
     try:
         dev1 = device.QueryInterface(_ID3D11Device1)
@@ -433,7 +435,6 @@ def _open_shared_resource(device, handle: int, src_pid: int = 0):
         print(f"[obscam] 試行2 例外: {e}")
 
     # ── 試行 3: OpenSharedResource1 + DuplicateHandle ────────────────────────
-    # プロセスローカル NT ハンドルの場合、先に複製が必要。
     if src_pid:
         print(f"[obscam] 試行3 OpenSharedResource1 + DuplicateHandle (pid={src_pid})")
         local_handle = _try_duplicate_handle(src_pid, handle)
@@ -563,12 +564,14 @@ class ObsCam:
         screen_width: ゲーム解像度幅
         screen_height:ゲーム解像度高さ
         obs_dir:      inject-helper64.exe 等があるディレクトリ
-        cuda:         True → torch.Tensor(CUDA) で返す
     """
 
-    INJECT_EXE          = "inject-helper64.exe"
-    HOOK_DLL            = "graphics-hook64.dll"
-    OFFSETS_EXE         = "get-graphics-offsets64.exe"
+    INJECT_EXE  = "inject-helper64.exe"
+    HOOK_DLL    = "graphics-hook64.dll"
+    OFFSETS_EXE = "get-graphics-offsets64.exe"
+
+    # map_size がこれ未満なら未初期化データとして待機継続
+    _MIN_VALID_MAP_SIZE = 1024
 
     def __init__(
         self,
@@ -601,8 +604,8 @@ class ObsCam:
         self._info_map     = None
         self._data_map     = None
 
-        self._hook_info_ptr  = None   # ctypes ポインタ (HookInfo)
-        self._shtex_ptr      = None   # ctypes ポインタ (ShtexData)
+        self._hook_info_ptr  = None
+        self._shtex_ptr      = None
 
         # D3D11
         self._device         = ctypes.c_void_p(0)
@@ -610,9 +613,7 @@ class ObsCam:
         self._shared_res     = ctypes.c_void_p(0)
         self._staging_tex    = ctypes.c_void_p(0)
         self._roi_box        = D3D11_BOX()
-
-        # ピン留めバッファ（_to_tensor_cpu で再利用し確保コストを排除）
-        self._pinned_buf: Optional[torch.Tensor] = None
+        self._shared_fmt     = DXGI_FORMAT_B8G8R8A8_UNORM
 
         # 連続キャプチャ
         self._latest: Optional[torch.Tensor] = None
@@ -622,11 +623,36 @@ class ObsCam:
         self.is_capturing = False
         self._capture_fps = 0.0
 
+        # ★ 再初期化中フラグ（hook_restart ループ防止）
+        self._reinitializing = False
+
+        # デバッグ用初回フラグ
+        self._dbg_desc_printed = False
+        self._dbg_printed      = False
+
         self._initialize()
 
     # ── 初期化 ────────────────────────────────────────────────────────────────
 
+    def _release_d3d_resources(self):
+        """D3D リソースだけを解放（再初期化前に呼ぶ）"""
+        _com_release(self._staging_tex)
+        _com_release(self._shared_res)
+        _com_release(self._ctx)
+        _com_release(self._device)
+        self._staging_tex = ctypes.c_void_p(0)
+        self._shared_res  = ctypes.c_void_p(0)
+        self._ctx         = ctypes.c_void_p(0)
+        self._device      = ctypes.c_void_p(0)
+
     def _initialize(self):
+        # D3D リソースを先に解放（再初期化時のリーク防止）
+        self._release_d3d_resources()
+
+        # デバッグフラグをリセット
+        self._dbg_desc_printed = False
+        self._dbg_printed      = False
+
         # 1. ウィンドウを探す
         self._hwnd = find_window(self.game_title)
         if not self._hwnd:
@@ -641,6 +667,11 @@ class ObsCam:
             raise RuntimeError("CreateKeepaliveMutex failed")
 
         # 3. 既にフック済みか確認
+        # ★ 修正: 再初期化時は古い hook_restart ハンドルを先に閉じる
+        if self._hook_restart:
+            close_handle(self._hook_restart)
+            self._hook_restart = None
+
         self._hook_restart = open_event(
             EVENT_MODIFY_STATE | SYNCHRONIZE, False,
             _map_name("CaptureHook_Restart", self._pid),
@@ -649,7 +680,6 @@ class ObsCam:
 
         if already_hooked:
             print("[obscam] フック検出（OBS等が既に注入済み）→ Restart を送って再初期化")
-            # Stop を送って既存キャプチャを停止させてから Restart
             _hook_stop_tmp = open_event(
                 EVENT_MODIFY_STATE | SYNCHRONIZE, False,
                 _map_name("CaptureHook_Stop", self._pid),
@@ -659,7 +689,7 @@ class ObsCam:
                 close_handle(_hook_stop_tmp)
                 time.sleep(0.3)
             set_event(self._hook_restart)
-            time.sleep(0.5)   # フックが再起動するのを少し待つ
+            time.sleep(0.5)
         else:
             print("[obscam] フックなし → DLL 注入開始")
             self._inject()
@@ -681,7 +711,9 @@ class ObsCam:
         self._hook_info.frame_interval    = 0
 
         # 7. フックイベントを開く
-        #    既にフック済みなら即座に開ける。注入直後なら待機が必要。
+        # ★ 修正: hook_restart も含めて全ハンドルをここで再オープンする
+        #   （古いハンドルを使い回すと、新しい restart イベントのリセットが
+        #     古いハンドルに対して行われてしまい、無限ループになる）
         wait_s = 1.0 if already_hooked else 15.0
 
         def _open_ev_wait(ev_name):
@@ -695,10 +727,23 @@ class ObsCam:
                 time.sleep(0.3)
             return None
 
-        self._hook_stop  = _open_ev_wait("CaptureHook_Stop")
-        self._hook_ready = _open_ev_wait("CaptureHook_HookReady")
-        self._hook_exit  = _open_ev_wait("CaptureHook_Exit")
-        self._hook_init  = _open_ev_wait("CaptureHook_Initialize")
+        # 既存のイベントハンドルを閉じてから再オープン
+        for attr in ("_hook_stop", "_hook_ready", "_hook_exit", "_hook_init"):
+            h = getattr(self, attr, None)
+            if h:
+                close_handle(h)
+                setattr(self, attr, None)
+
+        self._hook_stop    = _open_ev_wait("CaptureHook_Stop")
+        self._hook_ready   = _open_ev_wait("CaptureHook_HookReady")
+        self._hook_exit    = _open_ev_wait("CaptureHook_Exit")
+        self._hook_init    = _open_ev_wait("CaptureHook_Initialize")
+
+        # ★ 修正: hook_restart も閉じて最新ハンドルで再オープン
+        if self._hook_restart:
+            close_handle(self._hook_restart)
+            self._hook_restart = None
+        self._hook_restart = _open_ev_wait("CaptureHook_Restart")
 
         if not all([self._hook_stop, self._hook_ready, self._hook_exit, self._hook_init]):
             raise RuntimeError("CaptureHook イベントのオープンに失敗")
@@ -707,18 +752,22 @@ class ObsCam:
         if not set_event(self._hook_init):
             raise RuntimeError("SetEvent(hook_init) failed")
 
-        # 9. フック完了を待つ（既にフック済みなら hook_ready はすぐ返る）
+        # 9. フック完了を待つ
         print("[obscam] hook_ready 待機中...")
-        wait_for_single_object(self._hook_ready, 5000)   # 5秒タイムアウト
+        wait_for_single_object(self._hook_ready, 5000)
         print("[obscam] hook_ready 受信")
 
-        # 10. テクスチャミューテックス（ReleaseMutexできるようMUTEX_ALL_ACCESSで開く）
+        # 10. テクスチャミューテックス
         MUTEX_ALL_ACCESS = 0x1F0001
         for i, mname in enumerate(["CaptureHook_TextureMutex1", "CaptureHook_TextureMutex2"]):
+            # 再初期化時は古いハンドルを閉じる
+            if self._tex_mutex[i]:
+                close_handle(self._tex_mutex[i])
+                self._tex_mutex[i] = None
+
             full_name = _map_name(mname, self._pid)
             h = open_mutex(MUTEX_ALL_ACCESS, False, full_name)
             if not h:
-                # fallback: SYNCHRONIZE のみ
                 h = open_mutex(SYNCHRONIZE, False, full_name)
             if not h:
                 raise RuntimeError(f"OpenMutexPlusId failed: {mname}")
@@ -744,11 +793,18 @@ class ObsCam:
             print(f"[obscam] 共有テクスチャ desc 取得失敗 → BGRA fallback: {e}")
             shared_fmt = DXGI_FORMAT_B8G8R8A8_UNORM
 
-        self._shared_fmt = shared_fmt
+        self._shared_fmt  = shared_fmt
         self._staging_tex = _create_staging_texture(
             self._device, self._roi_w, self._roi_h, fmt=shared_fmt
         )
         self._roi_box = self._calc_roi_box()
+
+        # ★ 修正: 初期化完了後に hook_restart イベントを複数回空読みして全消費
+        #   再起動直後は複数の restart イベントがキューされている場合があるため、
+        #   1回では取りこぼすことがある
+        if self._hook_restart:
+            for _ in range(3):
+                wait_for_single_object(self._hook_restart, 0)
 
         print(f"[obscam] 初期化完了  mode={self.mode}  "
               f"ROI={self._roi_w}x{self._roi_h}")
@@ -767,11 +823,6 @@ class ObsCam:
         if not os.path.exists(hook_dll):
             raise RuntimeError(f"graphics-hook64.dll が見つかりません: {hook_dll}")
 
-        # lpApplicationName=None にして cmd に全部渡す (CreateProcessW の正しい使い方)
-        cmd = f'"{inject_exe}" "{hook_dll}" 1 {self._tid}'
-        print(f"[obscam] cmd: {cmd}")
-
-        # TID で試してから失敗時は PID で再試行
         for target_id, label in [(self._tid, "TID"), (self._pid, "PID")]:
             cmd = f'"{inject_exe}" "{hook_dll}" 1 {target_id}'
             print(f"[obscam] 注入試行 ({label}={target_id}): {cmd}")
@@ -819,34 +870,48 @@ class ObsCam:
             raise RuntimeError("MapViewOfFile (HookInfo) に失敗")
 
         self._hook_info_ptr = ptr
-        if not ptr:
-            raise RuntimeError("MapViewOfFile が NULL を返しました")
         self._hook_info = HookInfo.from_address(ptr)
 
     def _wait_for_shtex_data(self, timeout_s: float = 30.0):
-        """共有テクスチャデータが使えるようになるまでポーリング"""
         deadline = time.time() + timeout_s
         while time.time() < deadline:
             if self._data_map:
                 close_handle(self._data_map)
                 self._data_map = None
+            if self._shtex_ptr:
+                unmap_view_of_file(self._shtex_ptr)
+                self._shtex_ptr = None
 
-            name = _data_map_name(
-                self._hook_info.window, self._hook_info.map_id
-            )
+            name = _data_map_name(self._hook_info.window, self._hook_info.map_id)
+            map_size = self._hook_info.map_size
+            cap_type = self._hook_info.type  # 0=MEMORY, 1=TEXTURE
+
             print(f"[obscam] shtex map_name={name}  "
                   f"cx={self._hook_info.cx}  cy={self._hook_info.cy}  "
-                  f"map_size={self._hook_info.map_size}  "
-                  f"type={self._hook_info.type}")
+                  f"map_size={map_size}  type={cap_type}")
+
+            # ★ type=1 (TEXTURE) のとき map_size は使わない
+            #   ShtexData は tex_handle (uint32) だけなので固定 4 バイトで正しい
+            #   type=0 (MEMORY) のときだけ map_size が実際のバッファサイズになる
+            if cap_type == 1:  # CaptureType.TEXTURE
+                map_size_actual = ctypes.sizeof(ShtexData)  # = 4
+            else:
+                # MEMORY モード: map_size が小さすぎる場合はフック未完了
+                if map_size < self._MIN_VALID_MAP_SIZE:
+                    print(f"[obscam] map_size={map_size} が小さすぎる（未初期化）→ 待機継続")
+                    time.sleep(1.0)
+                    continue
+                map_size_actual = map_size
+
             self._data_map = open_file_mapping(FILE_MAP_ALL_ACCESS, False, name)
             if self._data_map:
                 ptr = map_view_of_file(
                     self._data_map, FILE_MAP_ALL_ACCESS,
-                    0, 0, self._hook_info.map_size,
+                    0, 0, map_size_actual,
                 )
                 if ptr:
                     self._shtex_ptr = ptr
-                    self._shtex     = ShtexData.from_address(ptr)
+                    self._shtex = ShtexData.from_address(ptr)
                     print(f"[obscam] tex_handle=0x{self._shtex.tex_handle:08X}")
                     return
             time.sleep(1.0)
@@ -874,7 +939,6 @@ class ObsCam:
                 if attempt + 1 >= max_retry:
                     raise RuntimeError("OpenSharedResource が最大試行回数を超えました")
 
-                # tex_handle が変わるまで少し待つ
                 time.sleep(0.5)
                 self._wait_for_shtex_data()
 
@@ -892,23 +956,52 @@ class ObsCam:
 
     def grab(self) -> Optional[torch.Tensor]:
         """単発キャプチャ。torch.Tensor(CUDA, uint8, [H,W,3], BGR) を返す。"""
+        # ★ 再初期化中は grab をスキップ（二重実行・ループ防止）
+        if self._reinitializing:
+            return None
+
         # restart イベントが来たら再初期化
         if wait_for_single_object(self._hook_restart or 0, 0) == WAIT_OBJECT_0:
             print("[obscam] hook_restart 検出 → 再初期化")
-            self._initialize()
+            self._reinitializing = True
+            try:
+                self._initialize()
+                # ★ 修正: 再初期化直後にフックが安定するまで少し待つ
+                #   これをしないと再初期化完了直後に再度 hook_restart が来てループする
+                time.sleep(0.5)
+            except Exception as e:
+                print(f"[obscam] 再初期化失敗: {e}")
+            finally:
+                self._reinitializing = False
+            return None  # 再初期化直後はフレームなし
 
         return self._grab()
 
     def _grab(self) -> Optional[torch.Tensor]:
-        # GPU 上で ROI をコピー（共有リソース → ステージング or interop テクスチャ）
         dst = self._staging_tex
 
-        # texture_mutex でロックしてからコピー（OBS と同じプロトコル）
+        # デバッグ: shared_res の desc を確認（初回のみ）
+        if not self._dbg_desc_printed:
+            try:
+                tex2d = self._shared_res.QueryInterface(_ID3D11Texture2D)
+                desc  = D3D11_TEXTURE2D_DESC()
+                tex2d.GetDesc(ctypes.byref(desc))
+                print(f"[obscam][DBG] shared_res desc: "
+                      f"{desc.Width}x{desc.Height} fmt={desc.Format} "
+                      f"usage={desc.Usage} misc={desc.MiscFlags:#010x}")
+                self._tex2d_shared = tex2d
+            except Exception as e:
+                print(f"[obscam][DBG] shared_res QI Texture2D 失敗: {e}")
+            self._dbg_desc_printed = True
+
+        # ★ 修正: タイムアウトを 8ms に変更
+        #   0ms だと CS2 が描画中にミューテックスを保持しているため
+        #   ほぼ毎フレーム取得失敗 → 0.9fps になる
         locked_idx = -1
         for i, mx in enumerate(self._tex_mutex):
             if not mx:
                 continue
-            ret = wait_for_single_object(mx, 0)   # ノンブロッキング
+            ret = wait_for_single_object(mx, 8)
             if ret == WAIT_OBJECT_0 or ret == 0x00000080:  # WAIT_ABANDONED も取得扱い
                 locked_idx = i
                 break
@@ -920,8 +1013,6 @@ class ObsCam:
             _copy_subresource_region(
                 self._ctx, dst, self._shared_res, self._roi_box
             )
-            # Flush は非同期コマンドをGPUに送るだけで、CPU はブロックしない。
-            # 次フレームで Map するまでに GPU が完了している前提（通常は十分間に合う）。
             self._ctx.Flush()
         except Exception as e:
             print(f"[obscam] CopySubresourceRegion 失敗: {e}")
@@ -934,7 +1025,7 @@ class ObsCam:
         return self._to_tensor_cpu()
 
     def _to_tensor_cpu(self) -> Optional[torch.Tensor]:
-        """CPU 経由フォールバック（ゼロコピー + 非同期CUDA転送）"""
+        """CPU 経由フォールバック"""
         try:
             mapped = _map_texture(self._ctx, self._staging_tex)
         except RuntimeError as e:
@@ -942,52 +1033,32 @@ class ObsCam:
             return None
 
         try:
-            row_w = mapped.RowPitch // 4   # BGRA → 4 bytes/px
+            buf = (ctypes.c_uint8 * (mapped.RowPitch * self._roi_h)).from_address(
+                mapped.pData
+            )
+            t = torch.frombuffer(bytearray(buf), dtype=torch.uint8).reshape(
+                self._roi_h, mapped.RowPitch // 4, 4
+            )
+            if mapped.RowPitch // 4 != self._roi_w:
+                t = t[:, :self._roi_w, :]
 
-            # ── ゼロコピー: Map済みアドレスを直接 torch に見せる ──────────────
-            # bytearray(buf) によるCPUコピーを排除。
-            # torch.frombuffer は外部メモリへの参照を保持するので
-            # Unmap 前に必ず contiguous clone するか CUDA 転送する。
-            raw = torch.frombuffer(
-                (ctypes.c_uint8 * (mapped.RowPitch * self._roi_h))
-                .from_address(mapped.pData),
-                dtype=torch.uint8,
-            ).reshape(self._roi_h, row_w, 4)
-
-            if row_w != self._roi_w:
-                raw = raw[:, :self._roi_w, :]
-
-            # ── ピン留めバッファ経由で非同期CUDA転送 ─────────────────────────
-            # _pinned_buf はフレームサイズが変わらない限り再利用する。
-            if torch.cuda.is_available():
-                need_channels = 3
-                h, w = self._roi_h, self._roi_w
-                if (self._pinned_buf is None
-                        or self._pinned_buf.shape != (h, w, need_channels)):
-                    self._pinned_buf = torch.empty(
-                        (h, w, need_channels), dtype=torch.uint8
-                    ).pin_memory()
-
-                # BGRA→BGR or RGBA→BGR をCPU側で確定してからピン留め先へ書く
-                DXGI_FORMAT_R8G8B8A8_UNORM = 28
-                if getattr(self, '_shared_fmt', DXGI_FORMAT_B8G8R8A8_UNORM) in (27, 28):
-                    self._pinned_buf.copy_(raw[..., [2, 1, 0]])  # RGBA→BGR
-                else:
-                    self._pinned_buf.copy_(raw[..., :3])         # BGRA→BGR
-
-                # non_blocking=True で CPU をブロックせずに転送開始
-                t = self._pinned_buf.to("cuda", non_blocking=True)
+            DXGI_FORMAT_R8G8B8A8_UNORM = 28
+            if self._shared_fmt in (27, 28):
+                # RGBA → BGR
+                t = t[..., [2, 1, 0]].clone()
             else:
-                # CUDA なし: clone して Map を解放できるようにする
-                DXGI_FORMAT_R8G8B8A8_UNORM = 28
-                if getattr(self, '_shared_fmt', DXGI_FORMAT_B8G8R8A8_UNORM) in (27, 28):
-                    t = raw[..., [2, 1, 0]].clone()
-                else:
-                    t = raw[..., :3].clone()
+                # BGRA → BGR
+                t = t[..., :3].clone()
 
+            if not self._dbg_printed:
+                print(f"[obscam][DBG] frame max={t.max().item()}  mean={t.float().mean().item():.1f}  "
+                      f"RowPitch={mapped.RowPitch}  fmt={self._shared_fmt}")
+                self._dbg_printed = True
         finally:
             _unmap_texture(self._ctx, self._staging_tex)
 
+        if torch.cuda.is_available():
+            t = t.to("cuda", non_blocking=True)
         return t
 
     # ── 連続キャプチャ ────────────────────────────────────────────────────────
@@ -1029,9 +1100,9 @@ class ObsCam:
         return self._latest
 
     def _capture_loop(self, target_fps: float):
-        interval  = 1.0 / target_fps
-        count     = 0
-        t_start   = time.perf_counter()
+        interval = 1.0 / target_fps
+        count    = 0
+        t_start  = time.perf_counter()
 
         while not self._stop_event.is_set():
             t0    = time.perf_counter()
@@ -1042,19 +1113,14 @@ class ObsCam:
                 count += 1
 
             elapsed_total = time.perf_counter() - t_start
-            if elapsed_total >= 1.0:   # 1秒ごとにFPS更新（0.5秒では計測が荒い）
+            if elapsed_total >= 0.5:
                 self._capture_fps = count / elapsed_total
                 count   = 0
                 t_start = time.perf_counter()
 
-            # 高精度スリープ: 残り時間の大半を sleep で返し、最後の2ms をビジーウェイト
             spent = time.perf_counter() - t0
-            remaining = interval - spent
-            if remaining > 0.002:
-                time.sleep(remaining - 0.002)
-            # ビジーウェイト（最後の2msを精度よく待機）
-            while time.perf_counter() - t0 < interval:
-                pass
+            if spent < interval:
+                time.sleep(interval - spent)
 
     @property
     def capture_fps(self) -> float:
@@ -1069,14 +1135,7 @@ class ObsCam:
     def release(self):
         self.stop()
 
-        self._pinned_buf = None  # ピン留めメモリを解放
-
-        for ptr in [self._staging_tex, self._shared_res, self._ctx, self._device]:
-            _com_release(ptr)
-        self._staging_tex = None
-        self._shared_res  = None
-        self._ctx         = None
-        self._device      = None
+        self._release_d3d_resources()
 
         for h in [
             self._hook_stop, self._hook_ready, self._hook_exit,
