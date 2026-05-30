@@ -39,7 +39,6 @@ def create(
     screen_width: int,
     screen_height: int,
     obs_dir: str = "obs_stuff",
-    cuda: bool = True,
 ) -> ObsCam:
     """
     ObsCam インスタンスを生成して返す。
@@ -52,7 +51,6 @@ def create(
         screen_height: ゲームの解像度 高さ
         obs_dir:       inject-helper64.exe / graphics-hook64.dll /
                        get-graphics-offsets64.exe が置かれたディレクトリ
-        cuda:          True → torch.Tensor(CUDA) で返す
 
     Returns:
         ObsCam
@@ -64,7 +62,6 @@ def create(
         screen_width=screen_width,
         screen_height=screen_height,
         obs_dir=obs_dir,
-        cuda=cuda,
     )
 
 
